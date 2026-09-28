@@ -264,6 +264,7 @@ detect_distro() {
         *KDE*|*Plasma*)  log_warn "compositor: KDE (${desktop}) — untested, AT-SPI step will be skipped" ;;
         *sway*)          log_warn "compositor: sway — untested" ;;
         *Hyprland*)      log_warn "compositor: hyprland — untested" ;;
+        *niri*|*Niri*)   log_warn "compositor: niri — window targeting via niri IPC, rest untested" ;;
         *)               log_warn "compositor: ${desktop} — untested" ;;
     esac
 }
