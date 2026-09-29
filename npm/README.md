@@ -45,6 +45,12 @@ environment to reuse a restore token instead. The first dialog still appears.
 Leave it unset to keep the prompt. The repository README records where the
 token is stored and who can read it.
 
+On niri, export the session's `NIRI_SOCKET` to the server. Window listing and
+exact focus use `niri msg` with a direct IPC fallback. Missing positions or
+unknown/mixed output scaling leave window-relative coordinates unavailable;
+focus the target and inspect a fresh full-screen screenshot before using
+desktop coordinates.
+
 If accessibility is disabled, run `computer-use-linux setup`. Setup writes and
 reads back GNOME's `toolkit-accessibility` setting and warns if only runtime
 accessibility is available. Restart target apps if their trees remain empty.

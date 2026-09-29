@@ -64,6 +64,12 @@ computer-use-linux doctor | jq .readiness
 
 If `doctor` selects ydotool as the input backend, also enable its per-user daemon with `systemctl --user enable --now ydotoold`. Direct uinput, X11 xdotool, and RemoteDesktop portal input do not require `ydotoold`.
 
+On niri, export the session's `NIRI_SOCKET` to the server. Window listing and
+exact focus use `niri msg` with a direct IPC fallback. Missing positions or
+unknown/mixed output scaling leave window-relative coordinates unavailable;
+focus the target and inspect a fresh full-screen screenshot before using
+desktop coordinates.
+
 On GNOME Wayland, log out and back in after `setup-window-targeting` if the GNOME Shell extension was newly installed.
 
 For MCP hosts with `COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE=1`, call the optional

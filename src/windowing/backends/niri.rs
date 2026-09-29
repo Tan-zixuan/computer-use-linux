@@ -1,16 +1,6 @@
-//! niri window backend.
-//!
-//! [niri](https://github.com/YaLTeR/niri) is a scrollable-tiling Wayland
-//! compositor that exposes a JSON IPC interface. This backend reads and focuses
-//! windows through `niri msg`, mirroring how the Hyprland backend uses
-//! `hyprctl`, and falls back to speaking niri's IPC protocol directly over the
-//! Unix socket in `NIRI_SOCKET` when the CLI cannot answer. The socket fallback
-//! covers hosts where `niri` is not on `PATH` and hosts that did not inherit
-//! `NIRI_SOCKET`, which `niri msg` requires.
-//!
-//! Both transports stay optional: when niri is not the running compositor the
-//! CLI fails and the socket is absent, so the backend reports a failure that
-//! the registry skips and another compositor backend can answer.
+//! Window listing and exact focus for niri, using `niri msg` with a direct IPC
+//! fallback. Both transports use the same session socket. Missing NIRI_SOCKET
+//! can be recovered only when runtime-directory discovery is unambiguous.
 
 use crate::command_runner;
 use crate::terminal::enrich_terminal_windows;
@@ -21,18 +11,18 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 pub const NIRI_BACKEND: &str = "niri";
 
-/// niri answers over a local socket in microseconds. The timeout only exists so
-/// a wedged compositor cannot hang `doctor` or `list_windows`.
+/// Bound individual socket reads and writes if the compositor stops responding.
 const NIRI_IPC_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_IPC_REPLY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Raw niri IPC requests. The socket takes JSON; `niri msg` takes argv.
 const WINDOWS_REQUEST: &str = "\"Windows\"";
@@ -47,7 +37,11 @@ const TRANSPORT_SOCKET: &str = "the niri IPC socket";
 const TRANSPORT_CLI: &str = "niri msg";
 
 pub fn probe() -> BackendProbe {
-    match list_windows_with_transport() {
+    match request_value(WINDOWS_REQUEST, WINDOWS_CLI, "Windows").and_then(|reply| {
+        let windows: Vec<NiriWindow> =
+            serde_json::from_value(reply.value).context("failed to parse the niri window list")?;
+        Ok((windows, reply.transport))
+    }) {
         Ok((windows, transport)) => BackendProbe {
             id: NIRI_BACKEND,
             ok: true,
@@ -110,14 +104,10 @@ fn activate_window_blocking(window_id: u64) -> Result<()> {
 
 fn list_windows_with_transport() -> Result<(Vec<WindowInfo>, &'static str)> {
     let reply = request_value(WINDOWS_REQUEST, WINDOWS_CLI, "Windows")?;
-    let windows: Vec<NiriWindow> = serde_json::from_value(reply.value)
-        .context("failed to parse the niri window list")?;
+    let windows: Vec<NiriWindow> =
+        serde_json::from_value(reply.value).context("failed to parse the niri window list")?;
 
-    // Output geometry is always needed: it supplies the scale factor that turns
-    // niri's logical window sizes into the device-pixel space screenshots use.
-    // It is fetched even when no window reports a position, because niri leaves
-    // `tile_pos_in_workspace_view` null for every window of a scrolling layout
-    // while still reporting a non-unit output scale.
+    // A missing workspace map should not discard a known output scale.
     let layout = output_layout().unwrap_or_default();
 
     let mut windows = windows
@@ -129,14 +119,8 @@ fn list_windows_with_transport() -> Result<(Vec<WindowInfo>, &'static str)> {
     Ok((windows, reply.transport))
 }
 
-/// Translates niri's logical coordinates into the physical pixel space that
-/// screenshots and window crops are expressed in.
-///
-/// A scaled output is captured as device pixels: on a 2x output a 1536x960
-/// logical desktop reports a 3072x1920 `coordinate_width`/`coordinate_height`,
-/// so logical window geometry has to be scaled and rebased, just as the
-/// Hyprland backend does for wlroots screenshots. Reporting niri's logical
-/// numbers unchanged would describe a crop at half the intended size.
+/// Maps a uniformly scaled logical desktop into device pixels. Capture paths
+/// with different output scales need capture metadata and are not inferred here.
 #[derive(Debug, Clone, Copy)]
 struct NiriCaptureLayout {
     origin_x: i32,
@@ -144,49 +128,21 @@ struct NiriCaptureLayout {
     scale: f64,
 }
 
-impl Default for NiriCaptureLayout {
-    /// Pass niri's logical geometry through unchanged when no output geometry
-    /// could be read. Size stays useful and positions stay honest.
-    fn default() -> Self {
-        Self {
-            origin_x: 0,
-            origin_y: 0,
-            scale: 1.0,
-        }
-    }
-}
-
 impl NiriCaptureLayout {
-    /// One desktop-wide layout, mirroring the Hyprland backend: the minimum
-    /// output origin becomes the capture origin and the largest output scale is
-    /// applied to every window.
-    fn from_outputs(outputs: &BTreeMap<String, NiriOutputGeometry>) -> Self {
-        let geometries = outputs.values().collect::<Vec<_>>();
-        let Some(first) = geometries.first() else {
-            return Self::default();
-        };
-        if geometries
-            .iter()
-            .any(|geometry| !geometry.scale.is_finite() || geometry.scale <= 0.0)
-        {
-            return Self::default();
+    /// A uniform output scale defines one desktop-wide pixel coordinate space.
+    /// Mixed scales require capture metadata; omit bounds rather than guess.
+    fn from_outputs(outputs: &BTreeMap<String, NiriOutputGeometry>) -> Option<Self> {
+        let first = outputs.values().next()?;
+        if outputs.values().any(|geometry| {
+            !geometry.scale.is_finite() || geometry.scale <= 0.0 || geometry.scale != first.scale
+        }) {
+            return None;
         }
-        Self {
-            origin_x: geometries
-                .iter()
-                .map(|geometry| geometry.x)
-                .min()
-                .unwrap_or(first.x),
-            origin_y: geometries
-                .iter()
-                .map(|geometry| geometry.y)
-                .min()
-                .unwrap_or(first.y),
-            scale: geometries
-                .iter()
-                .map(|geometry| geometry.scale)
-                .fold(first.scale, f64::max),
-        }
+        Some(Self {
+            origin_x: outputs.values().map(|geometry| geometry.x).min()?,
+            origin_y: outputs.values().map(|geometry| geometry.y).min()?,
+            scale: first.scale,
+        })
     }
 
     /// Device-pixel bounds for a logical window rect. A `None` position yields
@@ -224,7 +180,7 @@ struct NiriOutputLayout {
     geometries: BTreeMap<String, NiriOutputGeometry>,
     /// Workspace id -> name of the output currently holding it.
     workspace_outputs: BTreeMap<u64, String>,
-    capture: NiriCaptureLayout,
+    capture: Option<NiriCaptureLayout>,
 }
 
 impl NiriOutputLayout {
@@ -246,12 +202,14 @@ impl NiriOutputLayout {
 
 fn output_layout() -> Option<NiriOutputLayout> {
     let outputs = request_value(OUTPUTS_REQUEST, OUTPUTS_CLI, "Outputs").ok()?;
-    let workspaces = request_value(WORKSPACES_REQUEST, WORKSPACES_CLI, "Workspaces").ok()?;
+    let workspaces = request_value(WORKSPACES_REQUEST, WORKSPACES_CLI, "Workspaces").ok();
     let geometries = parse_output_geometries(&outputs.value);
     Some(NiriOutputLayout {
         capture: NiriCaptureLayout::from_outputs(&geometries),
         geometries,
-        workspace_outputs: parse_workspace_outputs(&workspaces.value),
+        workspace_outputs: workspaces
+            .map(|reply| parse_workspace_outputs(&reply.value))
+            .unwrap_or_default(),
     })
 }
 
@@ -295,15 +253,7 @@ struct NiriReply {
     transport: &'static str,
 }
 
-/// Run a read request, preferring `niri msg` and falling back to the IPC socket.
-///
-/// `niri msg` comes first so the common path matches the Hyprland backend's
-/// `hyprctl` shell-out and the reference niri adapter. The direct IPC fallback
-/// is not decorative: `niri msg` refuses to run at all when `NIRI_SOCKET` is
-/// unset ("are you running this within niri?"), and it cannot find the
-/// pid-suffixed `niri.$WAYLAND_DISPLAY.<pid>.sock` that current niri creates,
-/// while the socket can still be derived from `XDG_RUNTIME_DIR`. It also covers
-/// hosts where the `niri` binary is simply not on `PATH`.
+/// Prefer the CLI, with direct IPC as a fallback when the binary is unavailable.
 fn request_value(request: &str, cli_args: &[&str], key: &str) -> Result<NiriReply> {
     match cli_value(cli_args, key) {
         Ok(value) => Ok(NiriReply {
@@ -345,7 +295,9 @@ fn socket_value(request: &str, key: &str) -> Result<Value> {
 
 fn niri_cli(cli_args: &[&str]) -> Result<std::process::Output> {
     let mut command = StdCommand::new("niri");
-    command.args(cli_args);
+    command
+        .args(cli_args)
+        .env("NIRI_SOCKET", niri_socket_path()?);
     command_runner::output_blocking(&mut command, "run niri msg")
 }
 
@@ -365,27 +317,35 @@ fn command_detail(output: &std::process::Output) -> String {
 
 /// Send one JSON request over the niri IPC socket and return the raw reply.
 fn socket_request(request: &str) -> Result<String> {
-    let path = niri_socket_path().context(
-        "no niri IPC socket: NIRI_SOCKET is unset or not a socket and no niri.*.sock was found in XDG_RUNTIME_DIR",
-    )?;
-    let mut stream = UnixStream::connect(&path)
-        .with_context(|| format!("failed to connect to the niri IPC socket {}", path.display()))?;
-    let _ = stream.set_read_timeout(Some(NIRI_IPC_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(NIRI_IPC_TIMEOUT));
+    socket_request_at(&niri_socket_path()?, request)
+}
 
-    // niri answers only once it can tell the request is complete, so terminate
-    // with a newline and half-close the write side.
-    stream
-        .write_all(request.as_bytes())
-        .and_then(|()| stream.write_all(b"\n"))
-        .and_then(|()| stream.flush())
-        .with_context(|| format!("failed to send the niri IPC request {request}"))?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+fn socket_request_at(path: &Path, request: &str) -> Result<String> {
+    let mut stream = UnixStream::connect(path).with_context(|| {
+        format!(
+            "failed to connect to the niri IPC socket {}",
+            path.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(NIRI_IPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(NIRI_IPC_TIMEOUT))?;
+    writeln!(stream, "{request}").context("failed to send the niri IPC request")?;
 
+    // Replies are newline-delimited. The server may keep the connection open.
+    read_ipc_reply(stream)
+}
+
+fn read_ipc_reply(reader: impl Read) -> Result<String> {
     let mut reply = String::new();
-    stream
-        .read_to_string(&mut reply)
-        .with_context(|| format!("failed to read the niri IPC reply to {request}"))?;
+    BufReader::new(reader.take(MAX_IPC_REPLY_BYTES + 1))
+        .read_line(&mut reply)
+        .context("failed to read the niri IPC reply")?;
+    if reply.len() as u64 > MAX_IPC_REPLY_BYTES {
+        bail!("niri IPC reply exceeds the size limit");
+    }
+    if !reply.ends_with('\n') {
+        bail!("niri IPC connection closed before a complete reply");
+    }
     Ok(reply)
 }
 
@@ -400,82 +360,74 @@ fn parse_reply(raw: &str, key: &str) -> Result<Value> {
     if trimmed.is_empty() {
         bail!("the niri IPC reply was empty");
     }
-    let value: Value = serde_json::from_str(trimmed)
-        .with_context(|| format!("failed to parse the niri reply {trimmed}"))?;
-    if let Some(error) = value.get("Err").and_then(Value::as_str) {
-        bail!("niri IPC returned an error: {error}");
+    let value: Value = serde_json::from_str(trimmed).context("invalid niri JSON reply")?;
+    if value.get("Ok").is_none() && value.get("Err").is_none() {
+        return Ok(value); // Bare CLI payload.
     }
-    let value = match value {
-        Value::Object(mut map) => map.remove("Ok").unwrap_or(Value::Object(map)),
-        other => other,
-    };
-    match value {
-        Value::Object(mut map) => Ok(match map.remove(key) {
-            Some(payload) => payload,
-            None => Value::Object(map),
-        }),
-        other => Ok(other),
-    }
+    let result: std::result::Result<Value, String> =
+        serde_json::from_value(value).context("invalid niri IPC reply envelope")?;
+    let mut payload = result.map_err(|error| anyhow!("niri IPC returned an error: {error}"))?;
+    payload
+        .as_object_mut()
+        .and_then(|map| map.remove(key))
+        .with_context(|| format!("niri IPC reply does not contain {key}"))
 }
 
 /// Validate the reply to an `Action` request.
 fn ensure_socket_action_succeeded(request: &str, reply: &str) -> Result<()> {
-    let trimmed = reply.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return Ok(());
-    };
-    match value.get("Err").and_then(Value::as_str) {
-        Some(error) => bail!("niri IPC returned an error for {request}: {error}"),
-        None => Ok(()),
+    let result: std::result::Result<String, String> =
+        serde_json::from_str(reply).context("invalid niri IPC action reply")?;
+    match result {
+        Ok(response) if response == "Handled" => Ok(()),
+        Ok(response) => bail!("unexpected niri IPC action response: {response}"),
+        Err(error) => bail!("niri IPC returned an error for {request}: {error}"),
     }
 }
 
-/// Path of the running niri instance's IPC socket.
-fn niri_socket_path() -> Option<PathBuf> {
+/// An explicit socket is authoritative, even if stale. Never silently switch
+/// sessions when it fails. Discovery requires an unambiguous matching socket.
+fn niri_socket_path() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("NIRI_SOCKET") {
         let path = PathBuf::from(value);
-        if is_socket(&path) {
-            return Some(path);
+        if !is_socket(&path) {
+            bail!(
+                "NIRI_SOCKET does not identify a Unix socket: {}",
+                path.display()
+            );
         }
+        return Ok(path);
     }
-    infer_niri_socket_path()
+    let runtime = xdg_runtime_dir().context("cannot determine XDG_RUNTIME_DIR")?;
+    let display = std::env::var_os("WAYLAND_DISPLAY");
+    // WAYLAND_DISPLAY may be an absolute socket path.
+    let display = display
+        .as_deref()
+        .and_then(|value| Path::new(value).file_name());
+    let display = display.and_then(|value| value.to_str());
+    let display = display
+        .filter(|value| !value.is_empty())
+        .context("NIRI_SOCKET and WAYLAND_DISPLAY are unset; cannot identify the niri session")?;
+    infer_niri_socket_path(&runtime, display)
 }
 
-/// Recover the socket path when `NIRI_SOCKET` is missing.
-///
-/// niri itself falls back to `$XDG_RUNTIME_DIR/niri.$WAYLAND_DISPLAY.sock`, but
-/// current versions append the compositor pid
-/// (`niri.wayland-1.5081.sock`), so the exact name is tried first and then a
-/// pid-suffixed scan, mirroring how the Hyprland backend infers its instance
-/// signature.
-fn infer_niri_socket_path() -> Option<PathBuf> {
-    let runtime = xdg_runtime_dir()?;
-    let display = std::env::var("WAYLAND_DISPLAY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    if let Some(display) = display.as_deref() {
-        let exact = runtime.join(format!("niri.{display}.sock"));
-        if is_socket(&exact) {
-            return Some(exact);
-        }
-    }
-
-    let candidates = fs::read_dir(&runtime)
-        .ok()?
+fn infer_niri_socket_path(runtime: &Path, display: &str) -> Result<PathBuf> {
+    let candidates = fs::read_dir(runtime)
+        .context("cannot read the niri socket directory")?
         .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            let name = path.file_name()?.to_string_lossy().into_owned();
-            niri_socket_candidate(&path, &name, display.as_deref())
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            let stem = name.strip_prefix("niri.")?.strip_suffix(".sock")?;
+            if !is_socket(&path) || !niri_socket_name_matches_display(stem, display) {
+                return None;
+            }
+            Some(path)
         })
         .collect::<Vec<_>>();
-
-    select_niri_socket(candidates).map(|candidate| candidate.path)
+    match candidates.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => bail!("no niri IPC socket matches this session; export NIRI_SOCKET"),
+        _ => bail!("multiple niri IPC sockets match this session; export NIRI_SOCKET"),
+    }
 }
 
 fn is_socket(path: &Path) -> bool {
@@ -484,41 +436,13 @@ fn is_socket(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether a `niri.<stem>.sock` name belongs to the given `WAYLAND_DISPLAY`.
-///
-/// `wayland-1` matches both the plain `niri.wayland-1.sock` and the
-/// pid-suffixed `niri.wayland-1.<pid>.sock` that current niri uses, but never a
-/// different display such as `wayland-10`.
-fn niri_socket_name_matches_display(stem: &str, display: Option<&str>) -> bool {
-    display.is_some_and(|display| {
-        stem == display || stem.strip_prefix(display).is_some_and(|rest| rest.starts_with('.'))
-    })
-}
-
-fn niri_socket_candidate(
-    path: &Path,
-    name: &str,
-    display: Option<&str>,
-) -> Option<NiriSocketCandidate> {
-    let stem = name.strip_prefix("niri.")?.strip_suffix(".sock")?;
-    if !is_socket(path) {
-        return None;
-    }
-    let display_matches = niri_socket_name_matches_display(stem, display);
-    let modified = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    Some(NiriSocketCandidate {
-        path: path.to_path_buf(),
-        display_matches,
-        modified,
-    })
-}
-
-fn select_niri_socket(candidates: Vec<NiriSocketCandidate>) -> Option<NiriSocketCandidate> {
-    candidates
-        .into_iter()
-        .max_by_key(|candidate| (candidate.display_matches, candidate.modified))
+/// Match either the legacy name or a numeric PID suffix, never another display.
+fn niri_socket_name_matches_display(stem: &str, display: &str) -> bool {
+    stem == display
+        || stem
+            .strip_prefix(display)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn xdg_runtime_dir() -> Option<PathBuf> {
@@ -527,13 +451,6 @@ fn xdg_runtime_dir() -> Option<PathBuf> {
     }
     let uid = fs::metadata("/proc/self").ok()?.uid();
     Some(PathBuf::from(format!("/run/user/{uid}")))
-}
-
-#[derive(Debug)]
-struct NiriSocketCandidate {
-    path: PathBuf,
-    display_matches: bool,
-    modified: SystemTime,
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,8 +473,9 @@ struct NiriWindowLayout {
     window_size: Option<[f64; 2]>,
     tile_size: Option<[f64; 2]>,
     /// Position inside the workspace view, in logical coordinates. niri leaves
-    /// this `null` for windows whose workspace view is not being rendered.
+    /// this `null` when it cannot supply a rendered position.
     tile_pos_in_workspace_view: Option<[f64; 2]>,
+    window_offset_in_tile: Option<[f64; 2]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -569,14 +487,7 @@ struct NiriOutput {
 struct NiriOutputLogical {
     x: i32,
     y: i32,
-    /// Output scale factor. niri always reports it, but a missing value must not
-    /// drop the output, so it falls back to 1.0.
-    #[serde(default = "unit_scale")]
     scale: f64,
-}
-
-fn unit_scale() -> f64 {
-    1.0
 }
 
 /// Logical geometry of one output.
@@ -595,7 +506,14 @@ struct NiriWorkspace {
 
 impl NiriWindow {
     fn workspace_view_position(&self) -> Option<[f64; 2]> {
-        self.layout.as_ref()?.tile_pos_in_workspace_view
+        let layout = self.layout.as_ref()?;
+        let [x, y] = layout.tile_pos_in_workspace_view?;
+        let [dx, dy] = if layout.window_size.is_some() {
+            layout.window_offset_in_tile?
+        } else {
+            [0.0, 0.0]
+        };
+        Some([x + dx, y + dy])
     }
 
     /// Window size in niri's logical pixels, preferring the window's own size
@@ -609,7 +527,7 @@ impl NiriWindow {
     fn into_window_info(self, layout: &NiriOutputLayout) -> WindowInfo {
         let bounds = self.logical_size().and_then(|(width, height)| {
             layout
-                .capture
+                .capture?
                 .window_bounds(layout.position(&self), width, height)
         });
         WindowInfo {
@@ -623,8 +541,7 @@ impl NiriWindow {
                 .workspace_id
                 .and_then(|workspace| i32::try_from(workspace).ok()),
             focused: self.is_focused,
-            // niri's `is_minimized` is the window the rest of the server means
-            // by hidden, and minimized windows report no workspace.
+            // Minimized windows are hidden from targeted actions.
             hidden: self.is_minimized,
             client_type: None,
             backend: NIRI_BACKEND.to_string(),
@@ -638,7 +555,7 @@ fn positive_dimension(value: f64) -> Option<u32> {
         return None;
     }
     let rounded = value.round();
-    if rounded > f64::from(u32::MAX) {
+    if rounded < 1.0 || rounded > f64::from(u32::MAX) {
         return None;
     }
     Some(rounded as u32)
@@ -698,9 +615,8 @@ mod tests {
     }
 
     fn live_layout() -> NiriOutputLayout {
-        let geometries = parse_output_geometries(
-            &serde_json::from_str(LIVE_OUTPUTS).expect("outputs fixture"),
-        );
+        let geometries =
+            parse_output_geometries(&serde_json::from_str(LIVE_OUTPUTS).expect("outputs fixture"));
         NiriOutputLayout {
             capture: NiriCaptureLayout::from_outputs(&geometries),
             geometries,
@@ -770,11 +686,11 @@ mod tests {
         // coordinate_width/height 3072x1920 for this 1536x960 logical output.
         // Unscaled logical bounds would crop at half the intended size.
         let layout = live_layout();
-        assert_eq!(layout.capture.scale, 2.0);
+        assert_eq!(layout.capture.unwrap().scale, 2.0);
 
         let windows = parse_windows(
             r#"[{"id":1,"app_id":"a","workspace_id":6,
-                 "layout":{"window_size":[1536,908],"tile_pos_in_workspace_view":[10.0,20.0]}}]"#,
+                 "layout":{"window_size":[1536,908],"window_offset_in_tile":[0.0,0.0],"tile_pos_in_workspace_view":[10.0,20.0]}}]"#,
             &layout,
         );
         let bounds = windows[0].bounds.as_ref().unwrap();
@@ -783,12 +699,9 @@ mod tests {
     }
 
     #[test]
-    fn passes_logical_geometry_through_when_no_output_is_known() {
-        // Without output geometry there is no scale to apply, so bounds stay in
-        // niri's logical numbers instead of being fabricated.
+    fn omits_bounds_when_the_output_scale_is_unknown() {
         let windows = parse_windows(LIVE_WINDOWS, &NiriOutputLayout::default());
-        let bounds = windows[1].bounds.as_ref().unwrap();
-        assert_eq!((bounds.width, bounds.height), (1536, 908));
+        assert!(windows.iter().all(|window| window.bounds.is_none()));
     }
 
     #[test]
@@ -811,11 +724,11 @@ mod tests {
         );
         let json = r#"[
             {"id":1,"app_id":"a","workspace_id":6,
-             "layout":{"window_size":[800,600],"tile_pos_in_workspace_view":[100.4,49.6]}},
+             "layout":{"window_size":[800,600],"window_offset_in_tile":[0.0,0.0],"tile_pos_in_workspace_view":[100.4,49.6]}},
             {"id":2,"app_id":"b","workspace_id":9,
-             "layout":{"window_size":[800,600],"tile_pos_in_workspace_view":[10.0,20.0]}},
+             "layout":{"window_size":[800,600],"window_offset_in_tile":[0.0,0.0],"tile_pos_in_workspace_view":[10.0,20.0]}},
             {"id":3,"app_id":"c","workspace_id":null,
-             "layout":{"window_size":[800,600],"tile_pos_in_workspace_view":[10.0,20.0]}}
+             "layout":{"window_size":[800,600],"window_offset_in_tile":[0.0,0.0],"tile_pos_in_workspace_view":[10.0,20.0]}}
         ]"#;
         let windows = parse_windows(json, &layout);
 
@@ -837,13 +750,13 @@ mod tests {
             &[("eDP-1", 0, 100), ("HDMI-A-1", 0, 300)],
             &[(6, "eDP-1"), (9, "HDMI-A-1")],
         );
-        assert_eq!(layout.capture.origin_y, 100);
+        assert_eq!(layout.capture.unwrap().origin_y, 100);
 
         let json = r#"[
             {"id":1,"app_id":"a","workspace_id":6,
-             "layout":{"window_size":[800,600],"tile_pos_in_workspace_view":[10.0,20.0]}},
+             "layout":{"window_size":[800,600],"window_offset_in_tile":[0.0,0.0],"tile_pos_in_workspace_view":[10.0,20.0]}},
             {"id":2,"app_id":"b","workspace_id":9,
-             "layout":{"window_size":[800,600],"tile_pos_in_workspace_view":[10.0,20.0]}}
+             "layout":{"window_size":[800,600],"window_offset_in_tile":[0.0,0.0],"tile_pos_in_workspace_view":[10.0,20.0]}}
         ]"#;
         let windows = parse_windows(json, &layout);
 
@@ -862,7 +775,7 @@ mod tests {
             {"id":3,"app_id":"c"},
             {"id":4,"app_id":"d","layout":{"window_size":[800,600],"tile_size":[1.0,1.0]}}
         ]"#;
-        let windows = parse_windows(json, &NiriOutputLayout::default());
+        let windows = parse_windows(json, &layout_at_unit_scale(&[("eDP-1", 0, 0)], &[]));
 
         let bounds = windows[0].bounds.as_ref().unwrap();
         assert_eq!((bounds.width, bounds.height), (1201, 700));
@@ -911,7 +824,18 @@ mod tests {
     #[test]
     fn tolerates_actions_that_niri_answers_with_handled() {
         assert!(ensure_socket_action_succeeded("focus", r#"{"Ok":"Handled"}"#).is_ok());
-        assert!(ensure_socket_action_succeeded("focus", "").is_ok());
+        for reply in [
+            "",
+            "not json",
+            "{}",
+            r#"{"Ok":"Unknown"}"#,
+            r#"{"Ok":null}"#,
+        ] {
+            assert!(
+                ensure_socket_action_succeeded("focus", reply).is_err(),
+                "{reply}"
+            );
+        }
         assert!(ensure_socket_action_succeeded(
             "focus",
             r#"{"Err":"cannot focus: no such window"}"#
@@ -933,123 +857,202 @@ mod tests {
         );
         let edp = geometries.get("eDP-1").expect("eDP-1 should be parsed");
         assert_eq!((edp.x, edp.y, edp.scale), (0, 0, 2.0));
-        let hdmi = geometries.get("HDMI-A-1").expect("HDMI-A-1 should be parsed");
+        let hdmi = geometries
+            .get("HDMI-A-1")
+            .expect("HDMI-A-1 should be parsed");
         assert_eq!((hdmi.x, hdmi.y, hdmi.scale), (-1920, 100, 1.0));
         assert_eq!(geometries.get("DP-1"), None);
     }
 
     #[test]
-    fn capture_layout_rebases_to_the_minimum_origin_and_maximum_scale() {
-        let geometries = parse_output_geometries(
-            &serde_json::from_str(
-                r#"{
-                    "eDP-1":{"logical":{"x":0,"y":0,"scale":2.0}},
-                    "HDMI-A-1":{"logical":{"x":-1920,"y":100,"scale":1.0}}
-                }"#,
-            )
-            .unwrap(),
-        );
-        let capture = NiriCaptureLayout::from_outputs(&geometries);
-        assert_eq!((capture.origin_x, capture.origin_y), (-1920, 0));
-        assert_eq!(capture.scale, 2.0);
-    }
-
-    #[test]
-    fn capture_layout_rejects_an_unusable_output_scale() {
-        let geometries = parse_output_geometries(
-            &serde_json::from_str(
-                r#"{"eDP-1":{"logical":{"x":0,"y":0,"scale":0.0}}}"#,
-            )
-            .unwrap(),
-        );
-        let capture = NiriCaptureLayout::from_outputs(&geometries);
-        assert_eq!(capture.scale, 1.0);
-        assert_eq!((capture.origin_x, capture.origin_y), (0, 0));
-        assert_eq!(
-            NiriCaptureLayout::from_outputs(&BTreeMap::new()).scale,
-            1.0
+    fn only_uniform_valid_output_scales_produce_bounds() {
+        for scale in [0.0, -1.0, 1.25, 2.0] {
+            let geometries = parse_output_geometries(&serde_json::json!({
+                "A":{"logical":{"x":0,"y":100,"scale":2.0}},
+                "B":{"logical":{"x":-1920,"y":0,"scale":scale}}
+            }));
+            let capture = NiriCaptureLayout::from_outputs(&geometries);
+            if scale == 2.0 {
+                let capture = capture.unwrap();
+                assert_eq!(
+                    (capture.origin_x, capture.origin_y, capture.scale),
+                    (-1920, 0, 2.0)
+                );
+            } else {
+                assert!(capture.is_none());
+            }
+        }
+        assert!(NiriCaptureLayout::from_outputs(&BTreeMap::new()).is_none());
+        assert!(
+            parse_output_geometries(&serde_json::json!({"A":{"logical":{"x":0,"y":0}}})).is_empty()
         );
     }
 
     #[test]
-    fn reads_the_display_name_out_of_a_niri_socket_filename() {
-        assert!(niri_socket_name_matches_display("wayland-1", Some("wayland-1")));
-        // Current niri appends the compositor pid.
-        assert!(niri_socket_name_matches_display(
-            "wayland-1.5081",
-            Some("wayland-1")
-        ));
-        // A different display must never match, including the wayland-1 /
-        // wayland-10 prefix trap.
-        assert!(!niri_socket_name_matches_display(
-            "wayland-10.99",
-            Some("wayland-1")
-        ));
-        assert!(!niri_socket_name_matches_display("wayland-2", Some("wayland-1")));
-        assert!(!niri_socket_name_matches_display("wayland-1", None));
+    fn socket_names_require_an_exact_display_and_numeric_pid() {
+        for name in ["wayland-1", "wayland-1.5081"] {
+            assert!(niri_socket_name_matches_display(name, "wayland-1"));
+        }
+        for name in ["wayland-10.99", "wayland-2", "wayland-1.", "wayland-1.fake"] {
+            assert!(!niri_socket_name_matches_display(name, "wayland-1"));
+        }
     }
 
     #[test]
     fn parses_workspace_outputs_and_ignores_detached_workspaces() {
-        let outputs = parse_workspace_outputs(
-            &serde_json::from_str(LIVE_WORKSPACES).unwrap(),
-        );
+        let outputs = parse_workspace_outputs(&serde_json::from_str(LIVE_WORKSPACES).unwrap());
         assert_eq!(outputs.get(&6).map(String::as_str), Some("eDP-1"));
         assert_eq!(outputs.get(&7), None);
     }
 
-    #[test]
-    fn accepts_a_real_niri_socket_and_rejects_other_runtime_entries() {
-        let dir = std::env::temp_dir().join(format!("cul-niri-socket-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir should be creatable");
-
-        let socket = dir.join("niri.wayland-1.5081.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket)
-            .expect("a unix socket should be bindable");
-        let plain = dir.join("niri.lock");
-        fs::write(&plain, b"").expect("a plain file should be writable");
-        let other = dir.join("other.sock");
-        let _other_listener = std::os::unix::net::UnixListener::bind(&other)
-            .expect("a unix socket should be bindable");
-
-        let candidate = niri_socket_candidate(&socket, "niri.wayland-1.5081.sock", Some("wayland-1"))
-            .expect("a matching niri socket should be a candidate");
-        assert!(candidate.display_matches);
-
-        let mismatched = niri_socket_candidate(&socket, "niri.wayland-1.5081.sock", Some("wayland-9"))
-            .expect("the socket is still a candidate for another display");
-        assert!(!mismatched.display_matches);
-
-        // Not a socket, or not a `niri.*.sock` name at all.
-        assert!(niri_socket_candidate(&plain, "niri.lock", Some("wayland-1")).is_none());
-        assert!(niri_socket_candidate(&other, "other.sock", Some("wayland-1")).is_none());
-        assert!(niri_socket_candidate(&dir, "niri.dir.sock", Some("wayland-1")).is_none());
-
-        let _ = fs::remove_dir_all(&dir);
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).unwrap();
+            let path =
+                std::env::temp_dir().join(format!("niri-test-{}", u64::from_ne_bytes(random)));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
-    fn prefers_the_socket_of_the_matching_wayland_display() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let older = SystemTime::UNIX_EPOCH;
-        let candidates = vec![
-            NiriSocketCandidate {
-                path: PathBuf::from("/run/user/1000/niri.wayland-2.5.sock"),
-                display_matches: false,
-                modified: now,
-            },
-            NiriSocketCandidate {
-                path: PathBuf::from("/run/user/1000/niri.wayland-1.9.sock"),
-                display_matches: true,
-                modified: older,
-            },
-        ];
-        let selected = select_niri_socket(candidates).expect("a candidate should win");
-        assert_eq!(
-            selected.path,
-            PathBuf::from("/run/user/1000/niri.wayland-1.9.sock")
+    fn discovery_refuses_other_sessions_and_ambiguous_sockets() {
+        use std::os::unix::net::UnixListener;
+        let dir = TempDir::new();
+        let other = dir.0.join("niri.wayland-10.12.sock");
+        let _other = UnixListener::bind(&other).unwrap();
+        assert!(infer_niri_socket_path(&dir.0, "wayland-1").is_err());
+        let own = dir.0.join("niri.wayland-1.34.sock");
+        let _own = UnixListener::bind(&own).unwrap();
+        assert_eq!(infer_niri_socket_path(&dir.0, "wayland-1").unwrap(), own);
+        fs::write(dir.0.join("niri.wayland-1.56.sock"), "not a socket").unwrap();
+        assert_eq!(infer_niri_socket_path(&dir.0, "wayland-1").unwrap(), own);
+        let _duplicate = UnixListener::bind(dir.0.join("niri.wayland-1.78.sock")).unwrap();
+        assert!(infer_niri_socket_path(&dir.0, "wayland-1").is_err());
+    }
+
+    #[test]
+    fn uses_the_window_offset_for_decorated_or_centered_windows() {
+        let windows = parse_windows(
+            r#"[{"id":1,"workspace_id":6,"layout":{
+            "window_size":[100,80],"tile_pos_in_workspace_view":[10,20],
+            "window_offset_in_tile":[3,5]}}]"#,
+            &live_layout(),
         );
-        assert!(select_niri_socket(Vec::new()).is_none());
+        let bounds = windows[0].bounds.as_ref().unwrap();
+        assert_eq!(
+            (bounds.x, bounds.y, bounds.width, bounds.height),
+            (Some(26), Some(50), 200, 160)
+        );
+        let windows = parse_windows(
+            r#"[{"id":1,"workspace_id":6,"layout":{
+            "window_size":[100,80],"tile_pos_in_workspace_view":[10,20]}}]"#,
+            &live_layout(),
+        );
+        assert_eq!(windows[0].bounds.as_ref().unwrap().x, None);
+    }
+
+    #[test]
+    fn dimensions_must_still_be_positive_after_rounding() {
+        for value in [
+            0.0,
+            0.1,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::from(u32::MAX) + 1.0,
+        ] {
+            assert_eq!(positive_dimension(value), None);
+        }
+        assert_eq!(positive_dimension(0.5), Some(1));
+    }
+
+    #[test]
+    fn socket_reads_a_complete_line_without_waiting_for_eof() {
+        use std::os::unix::net::UnixListener;
+        let dir = TempDir::new();
+        let path = dir.0.join("niri.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(request, "\"Windows\"\n");
+            stream.write_all(b"{\"Ok\":{\"Windows\":[]}}\n").unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(4));
+        });
+        let reply = socket_request_at(&path, WINDOWS_REQUEST);
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            parse_reply(&reply.unwrap(), "Windows").unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn socket_rejects_truncated_and_oversized_replies() {
+        use std::os::unix::net::UnixListener;
+        for response in [
+            String::new(),
+            "{}".to_string(),
+            "x".repeat(MAX_IPC_REPLY_BYTES as usize + 1),
+        ] {
+            let dir = TempDir::new();
+            let path = dir.0.join("niri.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let _ = stream.write_all(response.as_bytes());
+            });
+            assert!(socket_request_at(&path, WINDOWS_REQUEST).is_err());
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn reads_only_the_first_newline_delimited_reply() {
+        let reply = read_ipc_reply(&b"{\"Ok\":{\"Windows\":[]}}\nsecond line\n"[..]).unwrap();
+        assert_eq!(
+            parse_reply(&reply, "Windows").unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_oversized_and_invalid_utf8_lines() {
+        for response in [
+            vec![],
+            b"{}".to_vec(),
+            vec![b'x'; MAX_IPC_REPLY_BYTES as usize + 1],
+            vec![0xff, b'\n'],
+        ] {
+            assert!(read_ipc_reply(response.as_slice()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_or_malformed_socket_envelopes() {
+        for response in [
+            r#"{"Ok":{"Outputs":{}}}"#,
+            r#"{"Ok":"Handled"}"#,
+            r#"{"Err":null}"#,
+            r#"{"Ok":{},"Err":"failure"}"#,
+        ] {
+            assert!(parse_reply(response, "Windows").is_err(), "{response}");
+        }
     }
 }

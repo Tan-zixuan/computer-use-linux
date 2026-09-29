@@ -94,8 +94,8 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
     BackendDescriptor {
         id: NIRI_BACKEND,
         failure_label: "niri",
-        list_note: "Window list came from the niri IPC socket (or niri msg). Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
-        missing_hint: "On niri, ensure the session exposes NIRI_SOCKET (or XDG_RUNTIME_DIR) so the niri IPC socket is reachable, or that niri msg is on PATH.",
+        list_note: "Window list came from niri msg or its direct IPC fallback. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
+        missing_hint: "On niri, export the session's NIRI_SOCKET or expose an unambiguous matching socket in XDG_RUNTIME_DIR. The niri binary is optional.",
         can_exact_focus: true,
     },
     BackendDescriptor {
