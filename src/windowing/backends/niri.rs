@@ -1,6 +1,11 @@
 //! Window listing and exact focus for niri, using `niri msg` with a direct IPC
-//! fallback. Both transports use the same session socket. Missing NIRI_SOCKET
-//! can be recovered only when runtime-directory discovery is unambiguous.
+//! fallback. Both transports use the same session socket, discovered from
+//! `NIRI_SOCKET` or, when that is unset, from an unambiguous `niri.*.sock` in
+//! `XDG_RUNTIME_DIR` matching `WAYLAND_DISPLAY`.
+//!
+//! The socket transport is not redundant: MCP hosts can spawn their servers
+//! with a scrubbed `PATH` that carries no `niri` binary, and `niri msg` refuses
+//! to run at all unless `NIRI_SOCKET` is set in its environment.
 
 use crate::command_runner;
 use crate::terminal::enrich_terminal_windows;
@@ -214,8 +219,7 @@ fn output_layout() -> Option<NiriOutputLayout> {
 }
 
 fn parse_output_geometries(outputs: &Value) -> BTreeMap<String, NiriOutputGeometry> {
-    let Ok(outputs) = serde_json::from_value::<BTreeMap<String, NiriOutput>>(outputs.clone())
-    else {
+    let Ok(outputs) = BTreeMap::<String, NiriOutput>::deserialize(outputs) else {
         return BTreeMap::new();
     };
     outputs
@@ -235,7 +239,7 @@ fn parse_output_geometries(outputs: &Value) -> BTreeMap<String, NiriOutputGeomet
 }
 
 fn parse_workspace_outputs(workspaces: &Value) -> BTreeMap<u64, String> {
-    let Ok(workspaces) = serde_json::from_value::<Vec<NiriWorkspace>>(workspaces.clone()) else {
+    let Ok(workspaces) = Vec::<NiriWorkspace>::deserialize(workspaces) else {
         return BTreeMap::new();
     };
     workspaces
@@ -508,6 +512,9 @@ impl NiriWindow {
     fn workspace_view_position(&self) -> Option<[f64; 2]> {
         let layout = self.layout.as_ref()?;
         let [x, y] = layout.tile_pos_in_workspace_view?;
+        // niri reports the tile offset alongside a size. A window that has a
+        // size without an offset has no rendered position yet, so report none
+        // rather than a guessed one.
         let [dx, dy] = if layout.window_size.is_some() {
             layout.window_offset_in_tile?
         } else {
